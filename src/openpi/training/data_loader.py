@@ -1,7 +1,12 @@
+# Copyright (c) 2023-2026, AgiBot Inc. All Rights Reserved.
+# Author: Genie Sim Team
+# License: Mozilla Public License Version 2.0
+
 from collections.abc import Iterator, Sequence
 import multiprocessing
 import os
 import typing
+from tqdm import tqdm
 from typing import Protocol, SupportsIndex, TypeVar
 
 import jax
@@ -136,17 +141,56 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    if isinstance(repo_id, list):
+        # If repo_id is a list, create a dataset for each repo_id and concatenate them.
+        dataset_metas = [lerobot_dataset.LeRobotDatasetMetadata(r) for r in repo_id]
+        dataset = lerobot_dataset.MultiLeRobotDataset(
+            repo_id,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
+                for dataset_meta in dataset_metas
+                for key in data_config.action_sequence_keys
+            },
+        )
+        if data_config.prompt_from_task:
+            for n, d in enumerate(dataset._datasets):
+                dataset._datasets[n] = TransformedDataset(
+                    d, [_transforms.PromptFromLeRobotTask(dataset_metas[n].tasks)]
+                )
+        if data_config.prompt_from_hl_instruction:
+            for n, d in enumerate(dataset._datasets):
+                dataset._datasets[n] = TransformedDataset(
+                    d,
+                    [
+                        _transforms.PromptFromHighlevelInstruction(
+                            dataset_metas[n].info["instruction_segments"], use_pause=data_config.use_pause
+                        )
+                    ],
+                )
+                dataset._datasets[n].num_frames = len(dataset._datasets[n])
 
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    else:
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
+                for key in data_config.action_sequence_keys
+            },
+        )
 
+        if data_config.prompt_from_task:
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        if data_config.prompt_from_hl_instruction:
+            dataset = TransformedDataset(
+                dataset,
+                [
+                    _transforms.PromptFromHighlevelInstruction(
+                        dataset_meta.info["instruction_segments"], use_pause=data_config.use_pause
+                    )
+                ],
+            )
+            dataset.num_frames = len(dataset)
     return dataset
 
 
@@ -164,7 +208,6 @@ def create_rlds_dataset(
         shuffle=shuffle,
         action_chunk_size=action_horizon,
         action_space=data_config.action_space,
-        filter_dict_path=data_config.filter_dict_path,
     )
 
 
@@ -287,6 +330,14 @@ def create_torch_data_loader(
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
+    sampler = None
+    shuffle = True
+    if data_config.dataloader_sampler != "":
+        from openpi.training.sampler import FrameSampler
+
+        sampler = FrameSampler(dataset, data_config.dataloader_sampler)
+        shuffle = False
+
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=batch_size // jax.process_count(),
@@ -295,8 +346,9 @@ def create_torch_data_loader(
         num_batches=num_batches,
         num_workers=num_workers,
         seed=seed,
+        sampler=sampler,
     )
-
+    # import pdb;pdb.set_trace()
     return DataLoaderImpl(data_config, data_loader)
 
 
@@ -349,6 +401,7 @@ class TorchDataLoader:
         num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
+        sampler=None,
     ):
         """Create a PyTorch data loader.
 
@@ -390,7 +443,7 @@ class TorchDataLoader:
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
-            shuffle=shuffle,
+            # shuffle=shuffle,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
             persistent_workers=num_workers > 0,
@@ -398,6 +451,7 @@ class TorchDataLoader:
             worker_init_fn=_worker_init_fn,
             drop_last=True,
             generator=generator,
+            sampler=sampler,
         )
 
     @property

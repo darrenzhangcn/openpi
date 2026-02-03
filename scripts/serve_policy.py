@@ -1,9 +1,20 @@
+# Copyright (c) 2023-2026, AgiBot Inc. All Rights Reserved.
+# Author: Genie Sim Team
+# License: Mozilla Public License Version 2.0
+
 import dataclasses
 import enum
 import logging
+import os
 import socket
 
 import tyro
+
+# Disable XLA autotuning that can cause ptxas crashes with bfloat16 GEMM operations
+# Error code 139 indicates segmentation fault during PTX compilation
+os.environ.setdefault("XLA_FLAGS", "")
+if "--xla_gpu_enable_triton_gemm=false" not in os.environ["XLA_FLAGS"]:
+    os.environ["XLA_FLAGS"] += " --xla_gpu_enable_triton_gemm=false"
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
@@ -18,6 +29,7 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
+    G1 = "g1"
 
 
 @dataclasses.dataclass
@@ -46,6 +58,7 @@ class Args:
     # prompt.
     default_prompt: str | None = None
 
+    host: str = "0.0.0.0"
     # Port to serve the policy on.
     port: int = 8000
     # Record the policy's behavior for debugging.
@@ -110,7 +123,7 @@ def main(args: Args) -> None:
 
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
-        host="0.0.0.0",
+        host=args.host,
         port=args.port,
         metadata=policy_metadata,
     )

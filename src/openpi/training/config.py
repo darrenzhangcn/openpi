@@ -1,3 +1,7 @@
+# Copyright (c) 2023-2026, AgiBot Inc. All Rights Reserved.
+# Author: Genie Sim Team
+# License: Mozilla Public License Version 2.0
+
 """See _CONFIGS for the list of available configs."""
 
 import abc
@@ -8,6 +12,8 @@ import logging
 import pathlib
 from typing import Any, Protocol, TypeAlias
 
+import numpy as np
+import os
 import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
@@ -20,6 +26,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.go1_policy as go1_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -89,12 +96,14 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    prompt_from_hl_instruction: bool = False
+
+    dataloader_sampler: str | None = ""
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
-    # Path to the data filter file for DROID dataset
-    filter_dict_path: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -171,6 +180,10 @@ class DataConfigFactory(abc.ABC):
     # Base config that will be updated by the factory.
     base_config: tyro.conf.Suppress[DataConfig | None] = None
 
+    state_mask = None
+    action_mask = None
+    norm_stats = None
+
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         """Create a data config."""
@@ -178,24 +191,119 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        if self._load_norm_stats is not None and self.norm_stats is not None and os.path.exists(self.norm_stats):
+            norm_stats = self._load_norm_stats_from_json(self.norm_stats)
+        else:
+            norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
-            use_quantile_norm=model_config.model_type != ModelType.PI0,
+            norm_stats=norm_stats,
+            use_quantile_norm=False,
         )
 
-    def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
+    def _load_norm_stats(self, assets_dir: epath.Path, asset_id) -> dict[str, _transforms.NormStats] | None:
         if asset_id is None:
             return None
         try:
-            data_assets_dir = str(assets_dir / asset_id)
-            norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
-            logging.info(f"Loaded norm stats from {data_assets_dir}")
+            if not isinstance(asset_id, list):
+                asset_id = [asset_id]
+
+            # method1: mean of those norm stats:
+            all_norm_stats = []
+            for a_id in asset_id:
+                data_assets_dir = str(assets_dir / a_id)
+                norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
+                logging.info(f"Loaded norm stats from {data_assets_dir}")
+                all_norm_stats.append(norm_stats)
+
+            agg = {}
+            for key in all_norm_stats[0].keys():
+                from openpi.shared.normalize import NormStats
+
+                agg[key] = NormStats(
+                    mean=np.mean([norm_stats[key].mean for norm_stats in all_norm_stats], axis=0),
+                    std=np.mean([norm_stats[key].std for norm_stats in all_norm_stats], axis=0),
+                    q01=np.mean([norm_stats[key].q01 for norm_stats in all_norm_stats], axis=0),
+                    q99=np.mean([norm_stats[key].q99 for norm_stats in all_norm_stats], axis=0),
+                )
+
+            norm_stats = agg
+
+            if self.state_mask is not None:
+                norm_stats["state"].std[self.state_mask] = 1e6
+                norm_stats["state"].mean[self.state_mask] = 0
+                norm_stats["state"].q01[self.state_mask] = 0
+                norm_stats["state"].q99[self.state_mask] = 0
+
+            if self.action_mask is not None:
+                # import ipdb; ipdb.set_trace()
+                norm_stats["actions"].std[self.action_mask] = 1e6
+                norm_stats["actions"].mean[self.action_mask] = 0
+                norm_stats["actions"].q01[self.action_mask] = 0
+                norm_stats["actions"].q99[self.action_mask] = 0
+
             return norm_stats
         except FileNotFoundError:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+        return None
+
+    def _load_norm_stats_from_json(self, json_path: str) -> dict[str, _transforms.NormStats] | None:
+        """
+        Load normalization statistics from JSON file path, functionality identical to _load_norm_stats
+
+        Args:
+            json_path: JSON file path
+
+        Returns:
+            Aggregated normalization statistics, returns None if loading fails
+        """
+        if json_path is None:
+            return None
+        try:
+            if not isinstance(json_path, list):
+                json_path = [json_path]
+
+            # method1: mean of those norm stats:
+            all_norm_stats = []
+            for j_path in json_path:
+                # Load JSON file
+                from openpi.shared.normalize import deserialize_json
+
+                json_file_path = pathlib.Path(j_path)
+                norm_stats = deserialize_json(json_file_path.read_text())
+                logging.info(f"Loaded norm stats from {json_file_path}")
+                all_norm_stats.append(norm_stats)
+
+            agg = {}
+            for key in all_norm_stats[0].keys():
+                from openpi.shared.normalize import NormStats
+
+                agg[key] = NormStats(
+                    mean=np.mean([norm_stats[key].mean for norm_stats in all_norm_stats], axis=0),
+                    std=np.mean([norm_stats[key].std for norm_stats in all_norm_stats], axis=0),
+                    q01=np.mean([norm_stats[key].q01 for norm_stats in all_norm_stats], axis=0),
+                    q99=np.mean([norm_stats[key].q99 for norm_stats in all_norm_stats], axis=0),
+                )
+
+            norm_stats = agg
+
+            if self.state_mask is not None:
+                norm_stats["state"].std[self.state_mask] = 1e6
+                norm_stats["state"].mean[self.state_mask] = 0
+                norm_stats["state"].q01[self.state_mask] = 0
+                norm_stats["state"].q99[self.state_mask] = 0
+
+            if self.action_mask is not None:
+                norm_stats["actions"].std[self.action_mask] = 1e6
+                norm_stats["actions"].mean[self.action_mask] = 0
+                norm_stats["actions"].q01[self.action_mask] = 0
+                norm_stats["actions"].q99[self.action_mask] = 0
+
+            return norm_stats
+        except FileNotFoundError:
+            logging.info(f"Norm stats not found in {json_file_path}, skipping.")
         return None
 
 
@@ -450,6 +558,96 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LerobotGo1DataConfig(DataConfigFactory):
+    """
+    Configuration for the Go1 robot dataset.
+    This config handles the data transforms for the Go1 robot's multi-camera setup and state/action space.
+    """
+
+    prompt_from_hl_instruction: bool = False
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    use_delta_joint_actions: bool = True
+
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    norm_stats: str | None = None
+
+    # Repack transforms to match the dataset keys to the expected format
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "top_head": "observation.images.top_head",
+                            "hand_left": "observation.images.hand_left",
+                            "hand_right": "observation.images.hand_right",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+
+    # Action keys that will be used to read the action sequence from the dataset
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    # if convert to eef position
+    convert_to_eef_position: bool = False
+
+    state_mask = np.array(_transforms.make_bool_mask(-16, 16))
+    action_mask = np.array(_transforms.make_bool_mask(-16, 16))
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Create data transforms for inputs and outputs
+        data_transforms = _transforms.Group(
+            inputs=[
+                go1_policy.Go1Inputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    state_mask=self.state_mask,
+                    action_mask=self.action_mask,
+                )
+            ],
+            outputs=[go1_policy.Go1Outputs()],
+        )
+
+        if self.convert_to_eef_position:
+            data_transforms = data_transforms.push(
+                inputs=[
+                    go1_policy.Go1FKTransform(action_dim=model_config.action_dim, model_type=model_config.model_type)
+                ],
+            )
+            delta_action_mask = _transforms.make_bool_mask(12, -2, 8)
+        else:
+            delta_action_mask = _transforms.make_bool_mask(14, -2, 6)
+
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(14, -2, 6)
+
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # Create model transforms
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -954,6 +1152,74 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="select_color",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/checkpoints/select_color/29999",
+            norm_stats="/root/openpi/checkpoints/select_color/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,  # rememble when training open
+    ),
+    TrainConfig(
+        name="recognize_size",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/checkpoints/recognize_size/29999",
+            norm_stats="/root/openpi/checkpoints/recognize_size/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,  # rememble when training open
+    ),
+    TrainConfig(
+        name="grasp_targets",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/checkpoints/grasp_targets/29999",
+            norm_stats="/root/openpi/checkpoints/grasp_targets/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,  # rememble when training open
+    ),
+    TrainConfig(
+        name="organize_items",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/checkpoints/organize_items/29999",
+            norm_stats="/root/openpi/checkpoints/organize_items/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,  # rememble when training open
     ),
     #
     # RoboArena configs.
